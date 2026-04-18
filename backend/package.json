@@ -1,0 +1,17 @@
+{
+  "name": "task-engine-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mysql2": "^3.9.7",
+    "uuid": "^9.0.1",
+    "winston": "^3.13.0",
+    "cors": "^2.8.5"
+  }
+}
