@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 
 // In-memory sliding window counter per API key
-const windows = new Map(); // apiKey -> [ timestamp, ... ]
+const windows = new Map();
 
 export function rateLimitMiddleware(req, res, next) {
   const apiKey = req.headers['x-api-key'];

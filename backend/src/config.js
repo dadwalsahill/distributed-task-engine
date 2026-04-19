@@ -3,6 +3,9 @@ dotenv.config();
 
 export const config = {
   port: process.env.PORT || 3001,
+  workerCount: parseInt(process.env.WORKER_COUNT || 4),
+  maxRetries: 3,
+  rateLimitPerMinute: 10,
   db: {
     host: process.env.DB_HOST || "localhost",
     user: process.env.DB_USER || "taskuser",

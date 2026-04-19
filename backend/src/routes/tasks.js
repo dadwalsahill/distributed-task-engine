@@ -95,6 +95,7 @@ router.post('/:id/retry', async (req, res) => {
       `UPDATE tasks SET status='queued', retry_count=0, progress=0, error_message=NULL, started_at=NULL, completed_at=NULL WHERE id=?`,
       [task.id]
     );
+    console.log("ADDING TASK TO QUEUE:", task.id);
 
     taskQueue.enqueue({
       id: task.id,

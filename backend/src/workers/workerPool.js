@@ -25,22 +25,24 @@ class WorkerPool {
 
   // Main scheduling loop — runs continuously
   _scheduleLoop() {
+     console.log("SCHEDULER RUNNING");
     if (!this.running) return;
     this._tryDispatch();
     setTimeout(() => this._scheduleLoop(), 500);
   }
 
   _tryDispatch() {
-    while (this.activeWorkers.size < this.maxWorkers) {
-      const task = taskQueue.dequeue();
-      if (!task) break;
-      this._runTask(task);
-    }
+    if (this.activeWorkers.size >= this.maxWorkers) return;
+
+    const task = taskQueue.dequeue();
+    if (!task) return;
+
+    this._runTask(task);
   }
 
   _runTask(task) {
     const startedAt = new Date();
-
+    let finished = false;
     const worker = new Worker(WORKER_SCRIPT, { workerData: { task } });
     this.activeWorkers.set(task.id, worker);
 
@@ -59,10 +61,9 @@ class WorkerPool {
     worker.on('message', async (msg) => {
       try {
         if (msg.type === 'progress') {
-          await query(`UPDATE tasks SET progress=? WHERE id=?`, [
-            msg.progress,
-            task.id,
-          ]);
+          const [taskRow] = await query(`SELECT status FROM tasks WHERE id=?`, [task.id]);
+
+          if (taskRow?.status !== 'running') return;
           sseManager.broadcast('task_update', {
             id: task.id,
             status: 'running',
@@ -71,6 +72,7 @@ class WorkerPool {
         } else if (msg.type === 'completed') {
           const now = new Date();
           const execMs = now - startedAt;
+          finished = true;
           await query(
             `UPDATE tasks SET status='completed', progress=100, completed_at=?, execution_time_ms=? WHERE id=?`,
             [now, execMs, task.id]
@@ -95,7 +97,7 @@ class WorkerPool {
     });
 
     worker.on('exit', async (code) => {
-      if (code !== 0 && this.activeWorkers.has(task.id)) {
+      if (!finished && code !== 0) {
         // Unexpected crash
         this.activeWorkers.delete(task.id);
         await this._handleFailure(task, `Worker exited with code ${code}`);
