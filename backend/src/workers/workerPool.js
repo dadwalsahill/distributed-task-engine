@@ -40,7 +40,6 @@ class WorkerPool {
   _runTask(task) {
     const startedAt = new Date();
     const taskId = task.id;
-
     const settled = { done: false };
 
     const worker = new Worker(WORKER_SCRIPT, { workerData: { task } });
@@ -56,20 +55,18 @@ class WorkerPool {
     worker.on('message', async (msg) => {
       if (msg.type === 'progress') {
         if (settled.done) return;
-        const [taskRow] = await query(`SELECT status FROM tasks WHERE id=?`, [taskId]);
-        if (taskRow?.status !== 'running') return;
-        await query(`UPDATE tasks SET progress=? WHERE id=?`, [msg.progress, taskId]);
+        await query(`UPDATE tasks SET progress=? WHERE id=? AND status='running'`, [msg.progress, taskId]);
         sseManager.broadcast('task_update', { id: taskId, status: 'running', progress: msg.progress });
       } else if (msg.type === 'completed') {
         if (settled.done) return;
         settled.done = true;
-        this.activeWorkers.delete(taskId);
         const now = new Date();
         const execMs = now - startedAt;
         await query(
           `UPDATE tasks SET status='completed', progress=100, completed_at=?, execution_time_ms=?, error_message=NULL WHERE id=?`,
           [now, execMs, taskId]
         );
+        this.activeWorkers.delete(taskId);
         sseManager.broadcast('task_update', { id: taskId, status: 'completed', progress: 100 });
         logger.info({ msg: 'Task completed', taskId, execMs });
       }
@@ -103,7 +100,6 @@ class WorkerPool {
         `UPDATE tasks SET status='dead_lettered', error_message=?, retry_count=? WHERE id=?`,
         [errorMessage, retryCount, taskId]
       );
-
       const existing = await query(`SELECT id FROM dead_letter_queue WHERE task_id=?`, [taskId]);
       if (existing.length === 0) {
         await query(
@@ -117,7 +113,6 @@ class WorkerPool {
           [retryCount, errorMessage, taskId]
         );
       }
-
       sseManager.broadcast('task_update', { id: taskId, status: 'dead_lettered' });
       logger.warn({ msg: 'Task dead-lettered', taskId, retryCount, errorMessage });
     } else {
@@ -140,7 +135,6 @@ class WorkerPool {
 
   async cancelTask(taskId) {
     const worker = this.activeWorkers.get(taskId);
-
     if (worker) {
       this.activeWorkers.delete(taskId);
       await worker.terminate();
