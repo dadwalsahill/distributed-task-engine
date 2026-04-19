@@ -29,7 +29,6 @@ class TaskQueue {
    * Returns null if nothing is queued.
    */
   dequeue() {
-    // Collect clients with pending tasks
     const activeClients = [];
    
     for (const [clientId, queue] of this.clientQueues.entries()) {
@@ -49,10 +48,6 @@ class TaskQueue {
     const chosenClient = activeClients[0];
     const queue = this.clientQueues.get(chosenClient);
     const task = queue.shift();
-    console.log("QUEUE SIZE:", queue.length);
-    // Advance this client's virtual time by the task's weight (inverse of priority
-    // so higher priority tasks cost more virtual time, which is intentional — it
-    // prevents a client from gaming fairness by only submitting high-priority tasks)
     const weight = 6 - task.priority; // priority 5 -> weight 1, priority 1 -> weight 5
     this.virtualTime.set(
       chosenClient,
@@ -62,7 +57,6 @@ class TaskQueue {
     // Cleanup empty queues
     if (queue.length === 0) {
       this.clientQueues.delete(chosenClient);
-      this.virtualTime.delete(chosenClient);
     }
 
     return task;

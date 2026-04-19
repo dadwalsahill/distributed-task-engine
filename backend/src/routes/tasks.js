@@ -197,18 +197,9 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ── List / filter tasks ───────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const {
-      status,
-      priority,
-      type,
-      from,
-      to,
-      page = 1,
-      limit = 20,
-    } = req.query;
+    const { status, priority, type, from, to, page = 1, limit = 20 } = req.query;
 
     const conditions = [];
     const params = [];
@@ -220,28 +211,22 @@ router.get('/', async (req, res) => {
     if (to) { conditions.push('created_at <= ?'); params.push(to); }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-
     const safeLimit = parseInt(limit) || 20;
-const safeOffset = parseInt(offset) || 0;
+    const safeOffset = ((parseInt(page) || 1) - 1) * safeLimit;
 
-const tasks = await query(
-  `SELECT * FROM tasks ${where} ORDER BY created_at DESC LIMIT ${safeLimit} OFFSET ${safeOffset}`,
-  params
-);
-
-    const countResult = await query(
-      `SELECT COUNT(*) as total FROM tasks ${where}`,
+    const tasks = await query(
+      `SELECT * FROM tasks ${where} ORDER BY created_at DESC LIMIT ${safeLimit} OFFSET ${safeOffset}`,
       params
     );
 
+    const countResult = await query(`SELECT COUNT(*) as total FROM tasks ${where}`, params);
     const total = countResult?.[0]?.total || 0;
 
     res.json({
       tasks: Array.isArray(tasks) ? tasks : [],
       total,
       page: parseInt(page),
-      limit: parseInt(limit)
+      limit: safeLimit,
     });
   } catch (e) {
     logger.error({ msg: 'List tasks error', err: e.message });

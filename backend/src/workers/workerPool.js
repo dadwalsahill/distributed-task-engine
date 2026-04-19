@@ -13,7 +13,7 @@ const WORKER_SCRIPT = join(__dirname, 'taskWorker.js');
 class WorkerPool {
   constructor() {
     this.maxWorkers = config.workerCount;
-    this.activeWorkers = new Map(); // taskId -> Worker
+    this.activeWorkers = new Map();
     this.running = false;
   }
 
@@ -23,150 +23,136 @@ class WorkerPool {
     this._scheduleLoop();
   }
 
-  // Main scheduling loop — runs continuously
   _scheduleLoop() {
-     console.log("SCHEDULER RUNNING");
     if (!this.running) return;
     this._tryDispatch();
     setTimeout(() => this._scheduleLoop(), 500);
   }
 
   _tryDispatch() {
-    if (this.activeWorkers.size >= this.maxWorkers) return;
-
-    const task = taskQueue.dequeue();
-    if (!task) return;
-
-    this._runTask(task);
+    while (this.activeWorkers.size < this.maxWorkers) {
+      const task = taskQueue.dequeue();
+      if (!task) break;
+      this._runTask(task);
+    }
   }
 
   _runTask(task) {
     const startedAt = new Date();
-    let finished = false;
-    const worker = new Worker(WORKER_SCRIPT, { workerData: { task } });
-    this.activeWorkers.set(task.id, worker);
+    const taskId = task.id;
 
-    // Mark task as running in DB
+    const settled = { done: false };
+
+    const worker = new Worker(WORKER_SCRIPT, { workerData: { task } });
+    this.activeWorkers.set(taskId, worker);
+
     query(
       `UPDATE tasks SET status='running', started_at=?, worker_id=?, progress=0 WHERE id=?`,
-      [startedAt, `worker-${process.pid}-${Date.now()}`, task.id]
+      [startedAt, `worker-${process.pid}-${Date.now()}`, taskId]
     ).catch((e) => logger.error({ msg: 'DB update failed', err: e.message }));
 
-    sseManager.broadcast('task_update', {
-      id: task.id,
-      status: 'running',
-      progress: 0,
-    });
+    sseManager.broadcast('task_update', { id: taskId, status: 'running', progress: 0 });
 
     worker.on('message', async (msg) => {
-      try {
-        if (msg.type === 'progress') {
-          const [taskRow] = await query(`SELECT status FROM tasks WHERE id=?`, [task.id]);
-
-          if (taskRow?.status !== 'running') return;
-          sseManager.broadcast('task_update', {
-            id: task.id,
-            status: 'running',
-            progress: msg.progress,
-          });
-        } else if (msg.type === 'completed') {
-          const now = new Date();
-          const execMs = now - startedAt;
-          finished = true;
-          await query(
-            `UPDATE tasks SET status='completed', progress=100, completed_at=?, execution_time_ms=? WHERE id=?`,
-            [now, execMs, task.id]
-          );
-          sseManager.broadcast('task_update', {
-            id: task.id,
-            status: 'completed',
-            progress: 100,
-          });
-          this.activeWorkers.delete(task.id);
-          logger.info({ msg: 'Task completed', taskId: task.id, execMs });
-        }
-      } catch (e) {
-        logger.error({ msg: 'Message handler error', err: e.message });
+      if (msg.type === 'progress') {
+        if (settled.done) return;
+        const [taskRow] = await query(`SELECT status FROM tasks WHERE id=?`, [taskId]);
+        if (taskRow?.status !== 'running') return;
+        await query(`UPDATE tasks SET progress=? WHERE id=?`, [msg.progress, taskId]);
+        sseManager.broadcast('task_update', { id: taskId, status: 'running', progress: msg.progress });
+      } else if (msg.type === 'completed') {
+        if (settled.done) return;
+        settled.done = true;
+        this.activeWorkers.delete(taskId);
+        const now = new Date();
+        const execMs = now - startedAt;
+        await query(
+          `UPDATE tasks SET status='completed', progress=100, completed_at=?, execution_time_ms=?, error_message=NULL WHERE id=?`,
+          [now, execMs, taskId]
+        );
+        sseManager.broadcast('task_update', { id: taskId, status: 'completed', progress: 100 });
+        logger.info({ msg: 'Task completed', taskId, execMs });
       }
     });
 
     worker.on('error', async (err) => {
-      logger.error({ msg: 'Worker error', taskId: task.id, err: err.message });
-      this.activeWorkers.delete(task.id);
-      await this._handleFailure(task, err.message);
+      if (settled.done) return;
+      settled.done = true;
+      this.activeWorkers.delete(taskId);
+      logger.error({ msg: 'Worker error', taskId, err: err.message });
+      await this._handleFailure(taskId, err.message);
     });
 
     worker.on('exit', async (code) => {
-      if (!finished && code !== 0) {
-        // Unexpected crash
-        this.activeWorkers.delete(task.id);
-        await this._handleFailure(task, `Worker exited with code ${code}`);
-      }
+      if (settled.done) return;
+      if (code === 0) { settled.done = true; return; }
+      settled.done = true;
+      this.activeWorkers.delete(taskId);
+      await this._handleFailure(taskId, `Worker exited with code ${code}`);
     });
   }
 
-  async _handleFailure(task, errorMessage) {
-    const retryCount = (task.retry_count || 0) + 1;
+  async _handleFailure(taskId, errorMessage) {
+    const [taskRow] = await query(`SELECT * FROM tasks WHERE id=?`, [taskId]);
+    if (!taskRow) return;
+
+    const retryCount = (taskRow.retry_count || 0) + 1;
 
     if (retryCount >= config.maxRetries) {
-      // Move to dead letter queue
       await query(
         `UPDATE tasks SET status='dead_lettered', error_message=?, retry_count=? WHERE id=?`,
-        [errorMessage, retryCount, task.id]
+        [errorMessage, retryCount, taskId]
       );
-      await query(
-        `INSERT INTO dead_letter_queue (id, task_id, type, priority, payload, client_api_key, retry_count, last_error)
-         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          task.id,
-          task.type,
-          task.priority,
-          JSON.stringify(task.payload),
-          task.client_api_key,
-          retryCount,
-          errorMessage,
-        ]
-      );
-      sseManager.broadcast('task_update', {
-        id: task.id,
-        status: 'dead_lettered',
-      });
-      logger.warn({
-        msg: 'Task dead-lettered',
-        taskId: task.id,
-        retryCount,
-        errorMessage,
-      });
+
+      const existing = await query(`SELECT id FROM dead_letter_queue WHERE task_id=?`, [taskId]);
+      if (existing.length === 0) {
+        await query(
+          `INSERT INTO dead_letter_queue (id, task_id, type, priority, payload, client_api_key, retry_count, last_error)
+           VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?)`,
+          [taskId, taskRow.type, taskRow.priority, JSON.stringify(taskRow.payload), taskRow.client_api_key, retryCount, errorMessage]
+        );
+      } else {
+        await query(
+          `UPDATE dead_letter_queue SET retry_count=?, last_error=?, dead_lettered_at=NOW() WHERE task_id=?`,
+          [retryCount, errorMessage, taskId]
+        );
+      }
+
+      sseManager.broadcast('task_update', { id: taskId, status: 'dead_lettered' });
+      logger.warn({ msg: 'Task dead-lettered', taskId, retryCount, errorMessage });
     } else {
-      // Re-queue for retry
       await query(
         `UPDATE tasks SET status='queued', retry_count=?, error_message=?, progress=0, started_at=NULL WHERE id=?`,
-        [retryCount, errorMessage, task.id]
+        [retryCount, errorMessage, taskId]
       );
-      taskQueue.enqueue({ ...task, retry_count: retryCount });
-      sseManager.broadcast('task_update', { id: task.id, status: 'queued', progress: 0 });
-      logger.info({
-        msg: 'Task requeued for retry',
-        taskId: task.id,
-        retryCount,
+      taskQueue.enqueue({
+        id: taskRow.id,
+        type: taskRow.type,
+        priority: taskRow.priority,
+        payload: taskRow.payload,
+        client_api_key: taskRow.client_api_key,
+        retry_count: retryCount,
       });
+      sseManager.broadcast('task_update', { id: taskId, status: 'queued', progress: 0 });
+      logger.info({ msg: 'Task requeued for retry', taskId, retryCount });
     }
   }
 
-  // Called when a cancel request comes in
   async cancelTask(taskId) {
     const worker = this.activeWorkers.get(taskId);
+
     if (worker) {
-      await worker.terminate();
       this.activeWorkers.delete(taskId);
+      await worker.terminate();
+      await this._handleFailure(taskId, 'Task cancelled by user');
     } else {
       taskQueue.remove(taskId);
+      await query(
+        `UPDATE tasks SET status='cancelled', completed_at=NOW() WHERE id=? AND status IN ('running','queued')`,
+        [taskId]
+      );
+      sseManager.broadcast('task_update', { id: taskId, status: 'cancelled' });
     }
-    await query(
-      `UPDATE tasks SET status='cancelled', completed_at=NOW() WHERE id=? AND status IN ('running','queued')`,
-      [taskId]
-    );
-    sseManager.broadcast('task_update', { id: taskId, status: 'cancelled' });
   }
 
   getStatus() {
